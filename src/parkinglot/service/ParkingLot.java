@@ -51,98 +51,125 @@ public class ParkingLot {
     }
 
     public Optional<Ticket> parkVehicle(Vehicle vehicle){
-        synchronized (lock) {
-            // Check if vehicle is already parked
-            if(activeTicketsByLicense.containsKey(vehicle.getLicenseNumber())){
-                throw new IllegalStateException("Vehicle " + vehicle.getLicenseNumber() + " is already parked");
-            }
+        // Fast path: Check if already parked (lock-free read)
+        if(activeTicketsByLicense.containsKey(vehicle.getLicenseNumber())){
+            throw new IllegalStateException("Vehicle " + vehicle.getLicenseNumber() + " is already parked");
+        }
 
-            if(parkingStrategy == null){
-                throw new IllegalStateException("Parking strategy not set");
-            }
+        if(parkingStrategy == null){
+            throw new IllegalStateException("Parking strategy not set");
+        }
 
+        // Fine-grained locking: Find and reserve spot WITHOUT holding the main lock
+        // This allows multiple threads to find spots concurrently
+        final int MAX_RETRIES = 10;
+        ParkingSpot reservedSpot = null;
+        
+        for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            // Find available spot (lock-free operation)
             Optional<ParkingSpot> parkingSpot = this.parkingStrategy.findParkingSpot(
                     new ArrayList<>(parkingFloors), vehicle);
-
-            if(parkingSpot.isPresent()){
-                ParkingSpot spot = parkingSpot.get();
-                // Try to park - returns false if spot was taken by another thread
-                if(!spot.parkVehicle(vehicle)){
-                    // Spot was taken, find another spot
-                    Optional<ParkingSpot> newSpot = this.parkingStrategy.findParkingSpot(
-                            new ArrayList<>(parkingFloors), vehicle);
-                    if(newSpot.isPresent() && newSpot.get().parkVehicle(vehicle)){
-                        spot = newSpot.get();
-                    } else {
-                        System.out.println("No Spot Found for this vehicle: "+vehicle.getLicenseNumber());
-                        return Optional.empty();
-                    }
-                }
-                
-                // Notify floor that spot is occupied (use final reference)
-                final ParkingSpot finalSpot = spot;
-                finalSpot.getParkingFloor().ifPresent(floor -> floor.onSpotOccupied(finalSpot));
-                
-                Ticket ticket = new Ticket(vehicle.getVehicleSize(), vehicle, spot);
-                activeTicketsByLicense.put(vehicle.getLicenseNumber(), ticket);
-                activeTicketsById.put(ticket.getTicketId(), ticket);
-                System.out.printf("\n%s spot successfully booked for vehicle license: %s\n", spot.getId(), vehicle.getLicenseNumber());
-                return Optional.of(ticket);
+            
+            if (!parkingSpot.isPresent()) {
+                // No spots available at all
+                break;
             }
-
+            
+            ParkingSpot spot = parkingSpot.get();
+            // Atomic reservation: Each spot has its own lock, so we only lock that specific spot
+            // This allows other threads to work on different spots concurrently
+            if (spot.parkVehicle(vehicle)) {
+                // Successfully reserved atomically at the spot level
+                reservedSpot = spot;
+                break;
+            }
+            // Spot was taken by another thread, retry with next attempt
+            // No lock held, so other threads can proceed
+        }
+        
+        if (reservedSpot == null) {
             System.out.println("No Spot Found for this vehicle: "+vehicle.getLicenseNumber());
             return Optional.empty();
+        }
+        
+        // Only lock when updating shared state (ticket maps)
+        // This is the minimal critical section
+        final ParkingSpot finalReservedSpot = reservedSpot;
+        synchronized (lock) {
+            // Double-check: Vehicle might have been parked by another thread
+            if(activeTicketsByLicense.containsKey(vehicle.getLicenseNumber())){
+                // Rollback: Free the spot we just reserved
+                finalReservedSpot.unparkVehicle();
+                finalReservedSpot.getParkingFloor().ifPresent(floor -> floor.onSpotFreed(finalReservedSpot));
+                throw new IllegalStateException("Vehicle " + vehicle.getLicenseNumber() + " is already parked");
+            }
+            
+            // Notify floor that spot is occupied
+            finalReservedSpot.getParkingFloor().ifPresent(floor -> floor.onSpotOccupied(finalReservedSpot));
+            
+            Ticket ticket = new Ticket(vehicle.getVehicleSize(), vehicle, finalReservedSpot);
+            activeTicketsByLicense.put(vehicle.getLicenseNumber(), ticket);
+            activeTicketsById.put(ticket.getTicketId(), ticket);
+            System.out.printf("\n%s spot successfully booked for vehicle license: %s\n", 
+                    finalReservedSpot.getId(), vehicle.getLicenseNumber());
+            return Optional.of(ticket);
         }
     }
 
     public Optional<Double> unparkVehicle(String licenseNumber){
+        Ticket ticket;
+        // Fine-grained: Only lock when accessing ticket map
         synchronized (lock) {
-            Ticket ticket = activeTicketsByLicense.remove(licenseNumber);
+            ticket = activeTicketsByLicense.remove(licenseNumber);
             if(ticket == null){
                 throw new IllegalArgumentException("Ticket not found for license: " + licenseNumber);
             }
             activeTicketsById.remove(ticket.getTicketId());
-
-            ticket.setExitDateTime(LocalDateTime.now());
-            ParkingSpot spot = ticket.getParkingSpot();
-            spot.unparkVehicle();
-            
-            // Notify floor that spot is freed (use final reference)
-            final ParkingSpot finalSpot = spot;
-            finalSpot.getParkingFloor().ifPresent(floor -> floor.onSpotFreed(finalSpot));
-
-            if(feeStrategy == null){
-                throw new IllegalStateException("Fee strategy not set");
-            }
-
-            Double parkingFee = feeStrategy.calculateFee(ticket);
-            return Optional.of(parkingFee);
         }
+        
+        // Release lock before unparking spot (allows concurrent unparking)
+        ticket.setExitDateTime(LocalDateTime.now());
+        ParkingSpot spot = ticket.getParkingSpot();
+        spot.unparkVehicle(); // Spot has its own lock
+        
+        // Notify floor that spot is freed
+        final ParkingSpot finalSpot = spot;
+        finalSpot.getParkingFloor().ifPresent(floor -> floor.onSpotFreed(finalSpot));
+
+        if(feeStrategy == null){
+            throw new IllegalStateException("Fee strategy not set");
+        }
+
+        Double parkingFee = feeStrategy.calculateFee(ticket);
+        return Optional.of(parkingFee);
     }
 
     public Optional<Double> unparkVehicleByTicketId(String ticketId){
+        Ticket ticket;
+        // Fine-grained: Only lock when accessing ticket map
         synchronized (lock) {
-            Ticket ticket = activeTicketsById.remove(ticketId);
+            ticket = activeTicketsById.remove(ticketId);
             if(ticket == null){
                 throw new IllegalArgumentException("Ticket not found for ticket ID: " + ticketId);
             }
             activeTicketsByLicense.remove(ticket.getParkedVehicle().getLicenseNumber());
-
-            ticket.setExitDateTime(LocalDateTime.now());
-            ParkingSpot spot = ticket.getParkingSpot();
-            spot.unparkVehicle();
-            
-            // Notify floor that spot is freed (use final reference)
-            final ParkingSpot finalSpot = spot;
-            finalSpot.getParkingFloor().ifPresent(floor -> floor.onSpotFreed(finalSpot));
-
-            if(feeStrategy == null){
-                throw new IllegalStateException("Fee strategy not set");
-            }
-
-            Double parkingFee = feeStrategy.calculateFee(ticket);
-            return Optional.of(parkingFee);
         }
+        
+        // Release lock before unparking spot
+        ticket.setExitDateTime(LocalDateTime.now());
+        ParkingSpot spot = ticket.getParkingSpot();
+        spot.unparkVehicle(); // Spot has its own lock
+        
+        // Notify floor that spot is freed
+        final ParkingSpot finalSpot = spot;
+        finalSpot.getParkingFloor().ifPresent(floor -> floor.onSpotFreed(finalSpot));
+
+        if(feeStrategy == null){
+            throw new IllegalStateException("Fee strategy not set");
+        }
+
+        Double parkingFee = feeStrategy.calculateFee(ticket);
+        return Optional.of(parkingFee);
     }
 
     public Optional<Ticket> getTicketByLicense(String licenseNumber){
